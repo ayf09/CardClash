@@ -1,10 +1,10 @@
-import * as Network from 'expo-network';
-import TcpSocket from 'react-native-tcp-socket';
-import Zeroconf from 'react-native-zeroconf';
 import { createLanRoomId, encodeLanMessage, isLocalIpv4, LAN_GAME_PORT, LAN_PROTOCOL_VERSION, LAN_SERVICE_DOMAIN, LAN_SERVICE_PROTOCOL, LAN_SERVICE_TYPE, LanLineDecoder, type LanRoom, type LanWireMessage } from './lan-protocol';
 
 type LanSocket = any;
 type LanServer = any;
+type ZeroconfClient = any;
+type TcpSocketModule = any;
+type NetworkModule = { getIpAddressAsync: () => Promise<string> };
 
 export type LanSessionEvents = {
   onRooms: (rooms: LanRoom[]) => void;
@@ -15,7 +15,9 @@ export type LanSessionEvents = {
 
 /** مسار لعب محلي خالص: mDNS للاكتشاف ثم TCP مباشر بين الهاتفين على Wi‑Fi. */
 export class LanSession {
-  private readonly zeroconf = new Zeroconf();
+  private zeroconf: ZeroconfClient | null = null;
+  private tcpSocket: TcpSocketModule | null = null;
+  private network: NetworkModule | null = null;
   private server: LanServer | null = null;
   private socket: LanSocket | null = null;
   private decoder = new LanLineDecoder();
@@ -24,27 +26,60 @@ export class LanSession {
   private selfId = '';
   private selfName = '';
 
-  constructor(private readonly events: LanSessionEvents) {
-    this.zeroconf.on('resolved', (service: any) => this.onResolved(service));
-    this.zeroconf.on('remove', (name: string) => { this.rooms.delete(name); this.emitRooms(); });
-    this.zeroconf.on('error', () => this.events.onState('failed', 'تعذر اكتشاف الغرف المحلية. تحقق من Wi‑Fi وصلاحية الشبكة.'));
+  constructor(private readonly events: LanSessionEvents) {}
+
+  /**
+   * تحميل وحدات الشبكة الأصلية عند الحاجة فقط.
+   *
+   * هذا مهم لأن LanSession يتم إنشاؤها من Root provider أثناء بدء التطبيق.
+   * تحميل react-native-tcp-socket / react-native-zeroconf في أعلى الملف يجعل
+   * React Native يلمس NativeModules فور تشغيل الـ JS bundle، وأي build قديم أو
+   * جهاز لا يحتوي الوحدة الأصلية المطابقة يمكن أن يغلق التطبيق قبل ظهور الواجهة.
+   */
+  private ensureNativeModules() {
+    if (this.zeroconf && this.tcpSocket && this.network) return;
+
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const networkModule = require('expo-network');
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const tcpSocketModule = require('react-native-tcp-socket');
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const zeroconfModule = require('react-native-zeroconf');
+
+      this.network = networkModule as NetworkModule;
+      this.tcpSocket = tcpSocketModule.default ?? tcpSocketModule;
+      const Zeroconf = zeroconfModule.default ?? zeroconfModule;
+      const zeroconf = new Zeroconf();
+      zeroconf.on('resolved', (service: any) => this.onResolved(service));
+      zeroconf.on('remove', (name: string) => { this.rooms.delete(name); this.emitRooms(); });
+      zeroconf.on('error', () => this.events.onState('failed', 'تعذر اكتشاف الغرف المحلية. تحقق من Wi‑Fi وصلاحية الشبكة.'));
+      this.zeroconf = zeroconf;
+    } catch (error) {
+      this.network = null;
+      this.tcpSocket = null;
+      this.zeroconf = null;
+      this.events.onState('failed', 'ميزة اللعب المحلي غير متاحة في هذا الإصدار من التطبيق. أعد تثبيت أحدث نسخة.');
+      throw error;
+    }
   }
 
   async host(playerId: string, playerName: string): Promise<LanRoom> {
+    this.ensureNativeModules();
     this.stop();
     this.selfId = playerId;
     this.selfName = playerName.trim().slice(0, 20) || 'لاعب محلي';
-    const localAddress = await Network.getIpAddressAsync();
+    const localAddress = await this.network!.getIpAddressAsync();
     if (!isLocalIpv4(localAddress)) throw new Error('تعذر الحصول على عنوان IPv4 محلي. اتصل بشبكة Wi‑Fi أولاً.');
     const room: LanRoom = { id: createLanRoomId(), name: `غرفة ${this.selfName}`, hostName: this.selfName, hostAddress: localAddress, port: LAN_GAME_PORT, version: LAN_PROTOCOL_VERSION };
-    const server = TcpSocket.createServer((socket: any) => this.attachSocket(socket, true)) as unknown as LanServer;
+    const server = this.tcpSocket!.createServer((socket: any) => this.attachSocket(socket, true)) as unknown as LanServer;
     this.server = server;
     await new Promise<void>((resolve, reject) => {
       server.on('error', (error: Error) => reject(error));
       server.listen({ port: LAN_GAME_PORT, host: '0.0.0.0' }, resolve);
     });
     this.hostedRoom = room;
-    this.zeroconf.publishService(LAN_SERVICE_TYPE, LAN_SERVICE_PROTOCOL, LAN_SERVICE_DOMAIN, room.id, LAN_GAME_PORT, {
+    this.zeroconf!.publishService(LAN_SERVICE_TYPE, LAN_SERVICE_PROTOCOL, LAN_SERVICE_DOMAIN, room.id, LAN_GAME_PORT, {
       roomId: room.id, hostName: room.hostName, hostId: playerId, version: String(LAN_PROTOCOL_VERSION),
     });
     this.events.onState('hosting', 'غرفتك مرئية الآن للأجهزة المتصلة بنفس شبكة Wi‑Fi.');
@@ -52,21 +87,23 @@ export class LanSession {
   }
 
   discover() {
-    this.zeroconf.stop('DNSSD' as any);
+    this.ensureNativeModules();
+    this.zeroconf!.stop('DNSSD' as any);
     this.rooms.clear();
     this.events.onRooms([]);
-    this.zeroconf.scan(LAN_SERVICE_TYPE, LAN_SERVICE_PROTOCOL, LAN_SERVICE_DOMAIN, 'DNSSD' as any);
+    this.zeroconf!.scan(LAN_SERVICE_TYPE, LAN_SERVICE_PROTOCOL, LAN_SERVICE_DOMAIN, 'DNSSD' as any);
     this.events.onState('discovering', 'نبحث عن غرف محلية قريبة…');
   }
 
   async join(room: LanRoom, playerId: string, playerName: string): Promise<void> {
+    this.ensureNativeModules();
     this.socket?.destroy();
     this.selfId = playerId;
     this.selfName = playerName.trim().slice(0, 20) || 'لاعب محلي';
     this.events.onState('connecting', `نتصل مباشرة بغرفة ${room.hostName}…`);
     try {
       await new Promise<void>((resolve, reject) => {
-        const socket = TcpSocket.createConnection({ host: room.hostAddress, port: room.port, connectTimeout: 5_000, interface: 'wifi' }, () => {
+        const socket = this.tcpSocket!.createConnection({ host: room.hostAddress, port: room.port, connectTimeout: 5_000, interface: 'wifi' }, () => {
           this.attachSocket(socket as LanSocket, false);
           this.send({ type: 'LAN_HELLO', payload: { playerId, playerName: this.selfName, version: LAN_PROTOCOL_VERSION } });
           resolve();
@@ -84,13 +121,19 @@ export class LanSession {
   stop() {
     this.socket?.destroy(); this.socket = null;
     this.server?.close(); this.server = null;
-    if (this.hostedRoom) this.zeroconf.unpublishService(this.hostedRoom.id);
+    if (this.hostedRoom && this.zeroconf) this.zeroconf.unpublishService(this.hostedRoom.id);
     this.hostedRoom = null;
-    this.zeroconf.stop('DNSSD' as any);
+    this.zeroconf?.stop('DNSSD' as any);
     this.rooms.clear(); this.events.onRooms([]); this.events.onPeer(null); this.events.onState('idle');
   }
 
-  dispose() { this.stop(); this.zeroconf.removeDeviceListeners(); }
+  dispose() {
+    this.stop();
+    this.zeroconf?.removeDeviceListeners();
+    this.zeroconf = null;
+    this.tcpSocket = null;
+    this.network = null;
+  }
 
   private attachSocket(socket: LanSocket, isHost: boolean) {
     this.socket?.destroy(); this.socket = socket; this.decoder = new LanLineDecoder();
